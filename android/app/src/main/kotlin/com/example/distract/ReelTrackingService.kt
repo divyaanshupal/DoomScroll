@@ -11,6 +11,7 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.LinearLayout
 import android.widget.TextView
 
@@ -20,7 +21,6 @@ class ReelTrackingService : AccessibilityService() {
     private var overlayView: LinearLayout? = null
     private var counterTextView: TextView? = null
     
-    // Instantiate our isolated logic engines
     private val instaTracker = InstagramTracker()
     private val ytTracker = YouTubeTracker()
 
@@ -28,13 +28,13 @@ class ReelTrackingService : AccessibilityService() {
     private var youtubeCount = 0
     private var currentPackageName = ""
     private var lastScrollTime = 0L
+    private var lastUiCheckTime = 0L
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        
         val prefs = getSharedPreferences("ReelPrefs", Context.MODE_PRIVATE)
         instaCount = prefs.getInt("insta_count", 0)
         youtubeCount = prefs.getInt("youtube_count", 0)
@@ -43,41 +43,52 @@ class ReelTrackingService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val eventPackage = event.packageName?.toString() ?: return
 
-        // 1. Blind Spot: Ignore our own floating pink bird
         if (eventPackage == "com.example.distract") return
 
-        // 2. Handle Window Swaps cleanly
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             val actualActivePackage = rootInActiveWindow?.packageName?.toString() ?: eventPackage
             if (actualActivePackage == "com.android.systemui") return 
             
-            if (currentPackageName != actualActivePackage) {
-                currentPackageName = actualActivePackage
-                adjustOverlayVisibility()
-                
-                // Reset index history when leaving apps so going back doesn't break counting
-                if (!instaTracker.isTargetPlatform(currentPackageName) && !ytTracker.isTargetPlatform(currentPackageName)) {
-                    instaTracker.reset()
-                    ytTracker.reset()
-                }
+            currentPackageName = actualActivePackage
+            
+            if (!instaTracker.isTargetPlatform(currentPackageName) && !ytTracker.isTargetPlatform(currentPackageName)) {
+                hideFloatingBirdOverlay()
+                instaTracker.reset()
+                ytTracker.reset()
+                return
             }
         }
 
-        // Drop events immediately if not in target apps (saves battery)
         if (!instaTracker.isTargetPlatform(currentPackageName) && !ytTracker.isTargetPlatform(currentPackageName)) return
 
-        // 3. Pass scroll events directly to our Tracker Engines
+        // UI Presence Scanner with Visibility Check
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastUiCheckTime > 500) { 
+            lastUiCheckTime = currentTime
+            val rootNode = rootInActiveWindow
+            if (rootNode != null) {
+                Thread {
+                    val inReels = checkIsReelsLayout(rootNode, currentPackageName)
+                    mainHandler.post {
+                        if (inReels) {
+                            if (overlayView == null) showFloatingBirdOverlay()
+                            updateOverlayUI()
+                        } else {
+                            hideFloatingBirdOverlay()
+                        }
+                    }
+                    rootNode.recycle()
+                }.start()
+            }
+        }
+
+        // Scroll Tracking Logic
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
             val rootNode = rootInActiveWindow ?: return
-            
             Thread {
-                val currentTime = System.currentTimeMillis()
-                // Anti-spam debounce
-                if (currentTime - lastScrollTime > 300) {
+                if (System.currentTimeMillis() - lastScrollTime > 300) {
                     var countUpdated = false
 
-                    // Let the engine decide if it was a real video swipe
-                    // FIX: Passing the full 'event' instead of 'event.fromIndex'
                     if (instaTracker.isTargetPlatform(currentPackageName)) {
                         if (instaTracker.checkForNewSwipe(rootNode, event)) {
                             instaCount++
@@ -91,7 +102,7 @@ class ReelTrackingService : AccessibilityService() {
                     }
 
                     if (countUpdated) {
-                        lastScrollTime = currentTime
+                        lastScrollTime = System.currentTimeMillis()
                         updateOverlayUI()
                         saveAndBroadcastCount()
                     }
@@ -101,14 +112,20 @@ class ReelTrackingService : AccessibilityService() {
         }
     }
 
-    private fun adjustOverlayVisibility() {
-        val isTargetApp = instaTracker.isTargetPlatform(currentPackageName) || ytTracker.isTargetPlatform(currentPackageName)
-        mainHandler.post {
-            if (isTargetApp && overlayView == null) showFloatingBirdOverlay()
-            else if (!isTargetApp && overlayView != null) hideFloatingBirdOverlay()
+    // UPDATED: Now strictly checks if the container is actually visible to the user!
+    private fun checkIsReelsLayout(node: AccessibilityNodeInfo, pkg: String): Boolean {
+        if (pkg == "com.instagram.android") {
+            val reelsNodes = node.findAccessibilityNodeInfosByViewId("com.instagram.android:id/clips_video_container")
+            // Must be strictly visible on screen, not just hidden in background cache
+            return reelsNodes.any { it.isVisibleToUser }
+        } else if (pkg == "com.google.android.youtube") {
+            val r1 = node.findAccessibilityNodeInfosByViewId("com.google.android.youtube:id/reel_recycler")
+            val r2 = node.findAccessibilityNodeInfosByViewId("com.google.android.youtube:id/reel_viewer_page")
+            val r3 = node.findAccessibilityNodeInfosByViewId("com.google.android.youtube:id/shorts_player_view")
             
-            if (isTargetApp && overlayView != null) updateOverlayUI()
+            return r1.any { it.isVisibleToUser } || r2.any { it.isVisibleToUser } || r3.any { it.isVisibleToUser }
         }
+        return false
     }
 
     private fun showFloatingBirdOverlay() {
@@ -136,11 +153,12 @@ class ReelTrackingService : AccessibilityService() {
             addView(counterTextView)
         }
         windowManager?.addView(overlayView, params)
-        updateOverlayUI()
     }
 
     private fun hideFloatingBirdOverlay() {
-        overlayView?.let { windowManager?.removeView(it); overlayView = null; counterTextView = null }
+        mainHandler.post {
+            overlayView?.let { windowManager?.removeView(it); overlayView = null; counterTextView = null }
+        }
     }
 
     private fun updateOverlayUI() {
