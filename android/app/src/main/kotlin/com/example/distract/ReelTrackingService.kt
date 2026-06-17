@@ -11,7 +11,6 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.LinearLayout
 import android.widget.TextView
 
@@ -20,91 +19,81 @@ class ReelTrackingService : AccessibilityService() {
     private var windowManager: WindowManager? = null
     private var overlayView: LinearLayout? = null
     private var counterTextView: TextView? = null
-    private var currentCount = 0
     
-    private var currentPackageName = ""
-    private val mainHandler = Handler(Looper.getMainLooper())
+    // Instantiate our isolated logic engines
+    private val instaTracker = InstagramTracker()
+    private val ytTracker = YouTubeTracker()
 
+    private var instaCount = 0
+    private var youtubeCount = 0
+    private var currentPackageName = ""
     private var lastScrollTime = 0L
-    private var lastInstaIndex = -1
-    private var lastYoutubeIndex = -1
+
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         
         val prefs = getSharedPreferences("ReelPrefs", Context.MODE_PRIVATE)
-        currentCount = prefs.getInt("daily_count", 0)
+        instaCount = prefs.getInt("insta_count", 0)
+        youtubeCount = prefs.getInt("youtube_count", 0)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val eventPackage = event.packageName?.toString() ?: return
 
-        // 1. The Blind Spot: Ignore our own floating bird
-        if (eventPackage == "com.example.distract") {
-            return
-        }
+        // 1. Blind Spot: Ignore our own floating pink bird
+        if (eventPackage == "com.example.distract") return
 
-        // 2. Handle App Switching (Strictly ONLY when the main window changes)
+        // 2. Handle Window Swaps cleanly
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            
-            // Double Verification: Make sure we check the actual window on the screen, 
-            // not just a background system transition.
             val actualActivePackage = rootInActiveWindow?.packageName?.toString() ?: eventPackage
-
-            // Ignore transient system UI flashes (like the volume slider popping up)
-            if (actualActivePackage == "com.android.systemui") return
+            if (actualActivePackage == "com.android.systemui") return 
             
             if (currentPackageName != actualActivePackage) {
                 currentPackageName = actualActivePackage
                 adjustOverlayVisibility()
                 
-                // Reset anti-wiggle indexes when leaving the app
-                if (actualActivePackage != "com.instagram.android" && actualActivePackage != "com.google.android.apps.youtube") {
-                    lastInstaIndex = -1
-                    lastYoutubeIndex = -1
+                // Reset index history when leaving apps so going back doesn't break counting
+                if (!instaTracker.isTargetPlatform(currentPackageName) && !ytTracker.isTargetPlatform(currentPackageName)) {
+                    instaTracker.reset()
+                    ytTracker.reset()
                 }
             }
         }
 
-        // --- BATTERY SAVER: Ignore all scroll/tap events outside target apps ---
-        if (currentPackageName != "com.instagram.android" && currentPackageName != "com.google.android.apps.youtube") {
-            return
-        }
+        // Drop events immediately if not in target apps (saves battery)
+        if (!instaTracker.isTargetPlatform(currentPackageName) && !ytTracker.isTargetPlatform(currentPackageName)) return
 
-        // 3. Handle Scrolling (The Smart Algorithm)
+        // 3. Pass scroll events directly to our Tracker Engines
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
-            
-            val fromIndex = event.fromIndex
-            val toIndex = event.toIndex
-            
-            if (fromIndex == -1 || toIndex == -1) return
-            if ((toIndex - fromIndex) > 1) return // Ignore fast scrolling through comment sections
-
             val rootNode = rootInActiveWindow ?: return
             
             Thread {
-                if (isReelsOrShortsLayout(rootNode, currentPackageName)) {
-                    val currentTime = System.currentTimeMillis()
-                    
-                    if (currentTime - lastScrollTime > 400) {
-                        var isValidForwardSwipe = false
+                val currentTime = System.currentTimeMillis()
+                // Anti-spam debounce
+                if (currentTime - lastScrollTime > 300) {
+                    var countUpdated = false
 
-                        if (currentPackageName == "com.instagram.android") {
-                            if (lastInstaIndex != -1 && fromIndex > lastInstaIndex) isValidForwardSwipe = true
-                            lastInstaIndex = fromIndex
-                        } 
-                        else if (currentPackageName == "com.google.android.apps.youtube") {
-                            if (lastYoutubeIndex != -1 && fromIndex > lastYoutubeIndex) isValidForwardSwipe = true
-                            lastYoutubeIndex = fromIndex
+                    // Let the engine decide if it was a real video swipe
+                    // FIX: Passing the full 'event' instead of 'event.fromIndex'
+                    if (instaTracker.isTargetPlatform(currentPackageName)) {
+                        if (instaTracker.checkForNewSwipe(rootNode, event)) {
+                            instaCount++
+                            countUpdated = true
                         }
+                    } else if (ytTracker.isTargetPlatform(currentPackageName)) {
+                        if (ytTracker.checkForNewSwipe(rootNode, event)) {
+                            youtubeCount++
+                            countUpdated = true
+                        }
+                    }
 
-                        if (isValidForwardSwipe) {
-                            currentCount++
-                            lastScrollTime = currentTime
-                            updateOverlayUI()
-                            saveAndBroadcastCount()
-                        }
+                    if (countUpdated) {
+                        lastScrollTime = currentTime
+                        updateOverlayUI()
+                        saveAndBroadcastCount()
                     }
                 }
                 rootNode.recycle()
@@ -112,37 +101,20 @@ class ReelTrackingService : AccessibilityService() {
         }
     }
 
-    private fun isReelsOrShortsLayout(node: AccessibilityNodeInfo, pkg: String): Boolean {
-        if (pkg == "com.instagram.android") {
-            val reelNodes = node.findAccessibilityNodeInfosByViewId("com.instagram.android:id/clips_video_container")
-            if (reelNodes.isNotEmpty()) return true
-        } else if (pkg == "com.google.android.apps.youtube") {
-            val shortsNodes = node.findAccessibilityNodeInfosByViewId("com.google.android.apps.youtube:id/shorts_player_view")
-            if (shortsNodes.isNotEmpty()) return true
-        }
-        return false
-    }
-
     private fun adjustOverlayVisibility() {
-        val isTargetApp = currentPackageName == "com.instagram.android" || 
-                          currentPackageName == "com.google.android.apps.youtube"
-
+        val isTargetApp = instaTracker.isTargetPlatform(currentPackageName) || ytTracker.isTargetPlatform(currentPackageName)
         mainHandler.post {
-            if (isTargetApp && overlayView == null) {
-                showFloatingBirdOverlay()
-            } else if (!isTargetApp && overlayView != null) {
-                hideFloatingBirdOverlay()
-            }
+            if (isTargetApp && overlayView == null) showFloatingBirdOverlay()
+            else if (!isTargetApp && overlayView != null) hideFloatingBirdOverlay()
+            
+            if (isTargetApp && overlayView != null) updateOverlayUI()
         }
     }
 
     private fun showFloatingBirdOverlay() {
         val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
+            WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.END
         params.x = 40
@@ -151,45 +123,41 @@ class ReelTrackingService : AccessibilityService() {
         overlayView = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(30, 16, 30, 16)
-            
-            val backgroundShape = GradientDrawable()
-            backgroundShape.shape = GradientDrawable.RECTANGLE
-            backgroundShape.cornerRadius = 50f
-            backgroundShape.setColor(Color.parseColor("#E91E63")) 
-            background = backgroundShape
-            
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 50f
+                setColor(Color.parseColor("#E91E63")) 
+            }
             counterTextView = TextView(this@ReelTrackingService).apply {
-                text = "🦩 $currentCount"
-                textSize = 18f
+                textSize = 16f
                 setTextColor(Color.WHITE)
                 setTypeface(null, android.graphics.Typeface.BOLD)
             }
             addView(counterTextView)
         }
-        
         windowManager?.addView(overlayView, params)
+        updateOverlayUI()
     }
 
     private fun hideFloatingBirdOverlay() {
-        overlayView?.let {
-            windowManager?.removeView(it)
-            overlayView = null
-            counterTextView = null
-        }
+        overlayView?.let { windowManager?.removeView(it); overlayView = null; counterTextView = null }
     }
 
     private fun updateOverlayUI() {
         mainHandler.post {
-            counterTextView?.text = "🦩 $currentCount"
+            if (instaTracker.isTargetPlatform(currentPackageName)) counterTextView?.text = "📸 $instaCount"
+            else if (ytTracker.isTargetPlatform(currentPackageName)) counterTextView?.text = "📺 $youtubeCount"
         }
     }
 
     private fun saveAndBroadcastCount() {
-        val prefs = getSharedPreferences("ReelPrefs", Context.MODE_PRIVATE)
-        prefs.edit().putInt("daily_count", currentCount).apply()
+        getSharedPreferences("ReelPrefs", Context.MODE_PRIVATE).edit()
+            .putInt("insta_count", instaCount)
+            .putInt("youtube_count", youtubeCount).apply()
 
         val intent = Intent("com.example.distract.UPDATE_COUNT")
-        intent.putExtra("count", currentCount)
+        intent.putExtra("insta", instaCount)
+        intent.putExtra("yt", youtubeCount)
         sendBroadcast(intent)
     }
 

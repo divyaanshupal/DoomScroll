@@ -4,7 +4,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
@@ -17,8 +16,12 @@ class MainActivity: FlutterActivity() {
 
     private val countUpdateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            val count = intent.getIntExtra("count", 0)
-            methodChannel?.invokeMethod("onScrollUpdated", count)
+            val insta = intent.getIntExtra("insta", 0)
+            val yt = intent.getIntExtra("yt", 0)
+            
+            // Send multiple data points back as a Map
+            val data = mapOf("insta" to insta, "yt" to yt)
+            methodChannel?.invokeMethod("onScrollUpdated", data)
         }
     }
 
@@ -28,15 +31,12 @@ class MainActivity: FlutterActivity() {
 
         methodChannel?.setMethodCallHandler { call, result ->
             when (call.method) {
-                // 1. Check Permissions
                 "isAccessibilityEnabled" -> {
                     result.success(isAccessibilityServiceEnabled(this))
                 }
                 "isOverlayEnabled" -> {
                     result.success(Settings.canDrawOverlays(this))
                 }
-                
-                // 2. Open Settings Screens
                 "openAccessibilitySettings" -> {
                     val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
                     startActivity(intent)
@@ -45,16 +45,18 @@ class MainActivity: FlutterActivity() {
                 "openOverlaySettings" -> {
                     val intent = Intent(
                         Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:$packageName")
+                        android.net.Uri.parse("package:$packageName")
                     )
                     startActivity(intent)
                     result.success(true)
                 }
-                
-                // 3. Data Fetching
                 "getInitialCount" -> {
                     val prefs = getSharedPreferences("ReelPrefs", Context.MODE_PRIVATE)
-                    result.success(prefs.getInt("daily_count", 0))
+                    val data = mapOf(
+                        "insta" to prefs.getInt("insta_count", 0),
+                        "yt" to prefs.getInt("youtube_count", 0)
+                    )
+                    result.success(data)
                 }
                 else -> result.notImplemented()
             }
